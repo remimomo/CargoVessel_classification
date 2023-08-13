@@ -1,0 +1,1118 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # AUL Cargo ML Analytics. 
+# MAGIC ##### Author: Sodiq Rafiu, LDH. 
+# MAGIC ### Date:   February 2023.
+
+# COMMAND ----------
+
+!pip install shap
+!pip install joblibspark
+!pip install catboost
+!pip install typing-extensions
+
+# COMMAND ----------
+
+# Import necessary libraries
+import sys, warnings, time, pickle, datetime, shap, json
+import pandas as pd, numpy as np, seaborn as sns, matplotlib.pyplot as plt
+from functools import wraps
+from scipy.special import expit 
+from sklearn  import metrics
+from sklearn.utils import shuffle
+from sklearn.utils import parallel_backend
+from joblibspark import register_spark
+from sklearn.feature_selection import RFECV, RFE
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from ldh_funcs import database
+from ldh_funcs.database import read_snowflake_to_df, write_df_to_snowflake, execute_snowflake
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score, precision_recall_curve
+from sklearn.metrics import ConfusionMatrixDisplay, roc_auc_score
+
+if not sys.warnoptions:
+    warnings.simplefilter('ignore')
+pd.set_option('display.max_columns', None)
+# Set size of plots in the notebook
+plt.rcParams['figure.figsize'] = [8, 6]
+plt.style.use('ggplot')
+
+# COMMAND ----------
+
+# Snowflake connection
+snowflake_config = {
+        'database': 'LDH',
+        'schema': 'CARGO',
+        'username': 'ldh_automation',
+        'password': 'ldh_automation_123$'
+    }
+
+# COMMAND ----------
+
+def logging(func):
+    """
+    Decorator function to apply logging.
+    """
+    @wraps (func)
+    def wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        time_take = round(time.perf_counter()-start_time, 2)
+        print(f"The function: {func.__name__} is successfully executed: {time_take} seconds" )
+        return result
+      
+    return wrapper
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Data Understanding Phase
+
+# COMMAND ----------
+
+@logging
+def extract_from_snowflake_to_df(query):
+    """
+    Function to extract data from snowflake to dataframe using the helper function.
+    :Param query: SQL query to extract the data.
+    """
+    df = read_snowflake_to_df(
+        sql = query, 
+        database = snowflake_config['database'], 
+        schema= 'CARGO', 
+        username = snowflake_config['username'], 
+        password = snowflake_config['password']
+    )
+
+    return df
+
+# COMMAND ----------
+
+@logging
+def drop_duplicates(df):
+    """
+    Function to drop duplicates records
+    : Param df: The data to use.
+    """
+    print('Number of instances before dropping duplicates:', len(df))
+    duplicates = df.duplicated()
+    if duplicates.any():
+        print('Number of duplicates found: ', duplicates.sum())
+        #df = df[~duplicates]
+        df = df.drop_duplicates(keep='last')
+        print('Number of instances after dropping duplicates: ', len(df))
+    else:
+        print('No duplicates found.')
+        print('Number of instances after:', len(df))
+    return df
+
+# COMMAND ----------
+
+@logging
+def drop_and_rename_upper_to_lower_columns(df, columns_to_drop=[], columns_dict={}):
+    """
+    Function to drops specified columns and renames others as well as convert column names from capital to lower.
+    : Param df: The dataframe to modify.
+    : Param columns_to_drop: A list of column names to drop from the dataframe.
+    : Param columns_dict: A dictionary of old column names (keys) and new column names (values).
+    """
+    #  Drop specified columns
+    df = df.drop(columns_to_drop, axis=1)
+    # Rename columns
+    df = df.rename(columns=columns_dict)
+    # Convert column names from capital to small letters
+    df.columns = [col.lower() for col in df.columns]
+    
+    return df
+
+# COMMAND ----------
+
+@logging
+def missing_values_table(df):
+    """
+    Function to calculate the percentage of missing values per column in a dataframe.
+    : Param df: The input dataframe
+    """
+    # Calculate the total number of missing values in each column
+    total_missing = df.isnull().sum()
+    # Calculate the percentage of missing values in each column
+    percent_missing = (total_missing / len(df))*100
+    # Create a new dataframe to store the results
+    missing_value_df = pd.DataFrame({'column_name':total_missing.index, 'percent_missing':percent_missing})
+    # Sort the dataframe by percentage of missing values
+    missing_value_df = missing_value_df.sort_values('percent_missing', ascending=False).reset_index(drop=True)
+    
+    return missing_value_df
+
+# COMMAND ----------
+
+@logging
+def drop_missing_columns(df, threshold=0.6):
+    """
+    Function to drop columns with high percentage of missing values based on the given threshold.
+    : Param df: The input dataframe.
+    : Param threshold: The maximum percentage of missing values allowed.
+    """
+    # Calculate the percentage of missing values for each column
+    percent_missing = df.isnull().sum()/len(df)
+    # Create a list of columns to drop
+    cols_to_drop = percent_missing[percent_missing > threshold].index.tolist()
+    # Drop columns from dataframe
+    df = df.drop(columns=cols_to_drop)
+    
+    return df
+
+# COMMAND ----------
+
+@logging
+def split_categorical_numerical(df):
+    """
+    Function to split data into categorical and numerical columns.
+    : Param df: The dataframe to use.
+    """
+    # Create an empty list to store data
+    cat_cols = []
+    num_cols = []
+    # Iterate over each column in the dataframe
+    for col in df.columns:
+        if df[col].dtype == np.object:
+            cat_cols.append(col)
+        else:
+            num_cols.append(col)
+    
+    return cat_cols, num_cols
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Data Preprocessing Phase
+
+# COMMAND ----------
+
+@logging
+def convert_column_to_lowercase(df, column_names=[]):
+    """
+    Function to convert values in a column into lowercase.
+    : Param df: The dataframe to modified.
+    : Param column_name: The name of the column to be converted to lowercase.
+    """
+    # Convert target_variable to numerical from categorical
+    df['target_variable'] = df['target_variable'].astype(int)
+    # Using the str.lower() method to convert all values in  the column into lowercase.
+    for col in column_names:
+        df[col] = df[col].str.lower()
+    
+    return df
+
+# COMMAND ----------
+
+@logging
+def split_data(df, test_size=0.2, random_state=42):
+    """
+    Function to shuffle and splits data into training, testing and validation sets using stratification.
+    : Param df: The dataframe to modified.
+    : Param test_size: The proportion of data to use for the test set.
+    : Param val_size: The proportion of data to use for the validation set.
+    : Param random_state: Random seed.
+    """
+    # shuffle data
+    df = shuffle(df, random_state=random_state)
+    # Split data into X and y objects
+    X = df.drop(['target_variable', 'location_id'], axis=1)
+    y = df['target_variable']
+    # Split data into training ang and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=random_state)
+    
+    return X_train, y_train, X_test, y_test
+
+# COMMAND ----------
+
+@logging
+def handle_high_cardinality(df, column, threshold):
+    """
+    Function to handle column with high cardinality, and a threshold value as input, then group lower frequency categories to Others
+    : Param df: The input dataframe.
+    : Param column: The column with the high cardinality
+    : Param threshold: Threshold value for lower frequency categories.
+    """
+    # Create a dictionary of category counts for the given column
+    cat_counts = dict(df[column].value_counts())
+    # Get the list of categories with counts above the threshold value
+    top_cats = [key for key, value in cat_counts.items() if value >= threshold]
+    # Group categories below the threshold value as 'Others'
+    df[column] = df[column].apply(lambda x: x if x in top_cats else 'Others')
+    
+    return df
+
+# COMMAND ----------
+
+@logging
+def preprocess_data(num_features, cat_features):
+    """
+    Function to put all the data pre-processing steps into pipeline.
+    : Param num_features: The numerical features.
+    : Param cat_features: The categorical features.
+    """
+    # Define the column transformer for preprocessing
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', MinMaxScaler())
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
+    ], )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_transformer, num_features),
+            ('cat', categorical_transformer, cat_features)
+        ], remainder='drop')
+    
+    return preprocessor
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Modelling Phase 
+
+# COMMAND ----------
+
+def feature_selection(X_train, y_train, X_test, estimator, scoring='accuracy'):
+    """
+    Function to perform feature selection using RFECV algorithm and return the selected features.
+    : Param X_train: Input feature.
+    : Param y_train: Target variable.
+    : Param estimator: Model estimator object.
+    : Param scoring: Scoring metric for cross-validation.
+    """
+    feature_selector = RFECV(estimator=estimator)
+    fit = feature_selector.fit(X_train, y_train)
+    optimal_feature_count = feature_selector.n_features_
+    print(f"Optimal number of features: {optimal_feature_count}")
+
+    X_train_optimal = X_train.loc[:, feature_selector.get_support()]
+    X_test_optimal = X_test.loc[:, feature_selector.get_support()]
+    # Plot the performance as a function of the number of selected features
+    plt.figure()
+    plt.title('RFECV Performance')
+    plt.xlabel('Number of Features Selected')
+    plt.ylabel(scoring)
+    plt.plot(range(1, len(fit.grid_scores_) + 1), fit.grid_scores_)
+    plt.show()
+    
+    return X_train_optimal, X_test_optimal
+
+# COMMAND ----------
+
+def build_and_optimise_model(X_train_optimal, y_train, X_test_optimal, y_test, estimator):
+    """
+    Function to optimise Decision Tree classifier parameters.
+    : Param X_train: The training features.
+    : Param y_train: The training features target variable.
+    : Param X_test: The testing features.
+    : Param y_train: The testing features target variable.
+    : Param estimator: The classifier to optimise.
+    """
+    param_grid = {
+        'l2_leaf_reg': [0.1, 1, 10], # Parameter controls the amount of L2 reggularization applied to the weight of the model.
+        'depth' : range(3, 15, 2), # Parameter determines the depth of the trees in the model.
+        'learning_rate':[0.01, 0.05, 0.1, 1], # Parameter controls the step size at each iteration of gradient boosting.
+        'bagging_temperature': [0.1, 0.5, 1], # Parameter controls the level of randomness in the model.
+    }
+    # Create an instance of the AdaBoost classifier
+    clf = estimator
+    # Perform a grid search over the parameter grid using cross-validation
+    grid_search = GridSearchCV(clf, param_grid=param_grid, cv=2, scoring='f1', n_jobs=-1)
+    grid_search.fit(X_train_optimal, y_train)
+    best_param = grid_search.best_params_
+    # Print the best parameters and  their F1 score on the test set
+    print("Best parameters: ", grid_search.best_params_)
+    y_pred = grid_search.predict(X_test_optimal)
+    print("F1 score on test set: ", f1_score(y_test, y_pred))
+    
+    return best_param
+
+# COMMAND ----------
+
+def select_best_algorithm(X_train, y_train, cv=5):
+    classifiers = {
+        'Logistic Regression': LogisticRegression(class_weight='balanced', random_state=42),
+        'Decision Tree Classifier': DecisionTreeClassifier(class_weight='balanced', random_state=42),
+        'Random Forest Classifier': RandomForestClassifier(class_weight='balanced', random_state=42),
+        'Bagging Classifier': BaggingClassifier(base_estimator=DecisionTreeClassifier(class_weight='balanced', random_state=42), random_state=42),
+        'AdaBoost Classifier': AdaBoostClassifier(base_estimator=DecisionTreeClassifier(class_weight='balanced', random_state=42), random_state=42),
+        'Gradient Boosting Classifier': GradientBoostingClassifier(random_state=42),
+        'XGB Classifier': XGBClassifier(random_state=42, objective='binary:logistic', use_label_encoder=False),
+        'CatBoost Classifier': CatBoostClassifier(random_state=42, silent=True),
+        'LightGBM Classifier': LGBMClassifier(class_weight='balanced', random_state=42),
+        'Extra Trees Classifier': ExtraTreesClassifier(class_weight='balanced', random_state=42)
+    }
+    
+    f1_scores = {}
+    for name, clf in classifiers.items():
+        kfold = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+        scores = cross_val_score(clf, X_train, y_train, cv=kfold, scoring='f1')
+        f1_scores[name] = scores
+    
+    # Plot the results
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.boxplot(f1_scores.values())
+    ax.set_xticklabels(f1_scores.keys(), rotation=45)
+    ax.set_xlabel('Classifier')
+    ax.set_ylabel('F1 Score')
+    ax.set_title('Performance Comparison of Classifiers')
+    plt.show()
+    
+    # Select the best classifier based on mean F1 score
+    mean_f1_scores = {name: np.mean(scores) for name, scores in f1_scores.items()}
+    best_classifier = max(mean_f1_scores, key=mean_f1_scores.get)
+    print(f"The best algorithm is {best_classifier} with mean F1 score of {mean_f1_scores[best_classifier]:.3f}")
+    
+    return classifiers[best_classifier]
+
+# COMMAND ----------
+
+def ml_pipeline(preprocessor, X, y, model):
+    """
+    Function to build a model.
+    : Param pipeline: The pre-processing pipeline.
+    : Param X: The input features.
+    : Param y: The target variable.
+    : Param model: The ML estimator to find pattern from data.
+    """
+    # Instantiate the object of Random Forest Classifier
+    estimator = RandomForestClassifier(random_state=42)
+    # Instantiate the pipeline object
+    clf_pipe = Pipeline(steps=[
+        ('preprocessing_pipeline', preprocessor),
+        ('feature_selection', RFECV(estimator)),
+        ('classifier', model)
+    ])
+    # Train the model
+    clf_pipe.fit(X, y)
+
+    return clf_pipe
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Evaluation Phase
+
+# COMMAND ----------
+
+def evaluate_model(model, X_train, X_test, y_train, y_test):
+    """
+    Function to evaluate model performance.
+    """
+    # Assess model performance
+    y_pred = model.predict(X_test)  # Based on 50% threshold
+    y_pred_prob = model.predict_proba(X_test)[:, 1] # Probabilities the properties belong to class 1
+    # Apply the optimal threshold to the predicted probabilities to obtain the predicted class lables
+    #predicted_labels = (y_pred_prob >= optimal_threshold).astype(int)
+    # Accuracy 
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f'Accuracy score on testing set: ', accuracy)
+    print('---------------------------------------------------------------------')
+    # Overfitting check 
+    y_pred_train = model.predict(X_train)
+    accuracy_on_train = accuracy_score(y_train, y_pred_train)
+    print(f'Performance on training set: ', accuracy_on_train)
+    print('---------------------------------------------------------------------')
+    # Precision
+    precision = precision_score(y_test, y_pred)
+    print(f'Precision :', precision)
+    print('---------------------------------------------------------------------')
+    # Recall
+    recall = recall_score(y_test, y_pred)
+    print(f'Recall :', recall)
+    print('---------------------------------------------------------------------')
+    # F1-score
+    f1 = f1_score(y_test, y_pred)
+    print(f'F1-score', f1)
+    print('---------------------------------------------------------------------')
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.style.use('seaborn-poster')
+    plt.figure(figsize=(5, 5))
+    plt.matshow(cm, cmap='coolwarm')
+    plt.gca().xaxis.tick_bottom()
+    plt.title('Confusion Matrix')
+    plt.ylabel('Actual Class')
+    plt.xlabel('Predicted Class')
+    for (i, j), corr_value in np.ndenumerate(cm):
+        plt.text(j, i, corr_value, ha='center', va='center', fontsize=20)
+    plt.show()
+
+# COMMAND ----------
+
+def find_optimal_threshold(y_test, y_pred_prob):
+    """
+    Function to find optimal threshold of model.
+    """
+    thresholds = np.arange(0, 1, 0.01)
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    for threshold in thresholds:
+        pred_class = (y_pred_prob >= threshold) * 1
+        precision = precision_score(y_test, pred_class, zero_division=0)
+        precision_scores.append(precision)
+        recall = recall_score(y_test, pred_class)
+        recall_scores.append(recall)
+        f1 = f1_score(y_test, pred_class)
+        f1_scores.append(f1)
+    #   Finding the maximum f1-score and the index of the maximum f1-score
+    max_f1 = max(f1_scores)
+    max_f1_idx = f1_scores.index(max_f1)
+    plt.style.use('seaborn-poster')
+    plt.plot(thresholds, precision_scores, label='Precision', linestyle='--')
+    plt.plot(thresholds, recall_scores, label='Recall', linestyle='--')
+    plt.plot(thresholds, f1_scores, label='f1', linewidth=5)
+    plt.title(f'Finding the Optimal Threshold for Classification Model \n Max F1: {round(max_f1, 2)}(Threshold =  {round(thresholds[max_f1_idx], 2)})')
+    plt.xlabel('Threshold')
+    plt.ylabel('Assess Score')
+    plt.legend(loc='=lower left')
+    plt.tight_layout()
+    plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Call Functions
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Data Understanding functions
+
+# COMMAND ----------
+
+# Extract data from snowflake
+query = '''SELECT * FROM "LDH"."CARGO"."CARGO_ALL_v2"'''
+# df = extract_from_snowflake_to_df(query)
+df = database.read_snowflake_to_df(
+   sql = query, 
+   database = snowflake_config['database'], 
+   schema= 'CARGO', 
+   username = snowflake_config['username'], 
+   password = snowflake_config['password']
+)
+
+# COMMAND ----------
+
+# Take a copy from the actual dataframe
+df_new = df.copy()
+
+# COMMAND ----------
+
+# Check and drop duplicates records
+df_new = drop_duplicates(df_new)
+
+# COMMAND ----------
+
+# Drop unnecessary and rename columns
+columns_to_drop = ['PLAN_URL', 'BUILDING_URL', 'PARCEL_WKT', 'GEOCODING_SCORE', 'GEOCODED_ADDRESS', 'BUILDING_FOOTPRINT', 'NR_OF_STORIES_CONFIDENCES', 'CONSTRUCTION_TYPE_CONFIDENCES', 'ROOF_GEOMETRY_CONFIDENCES', 'ROOF_PITCH_CONFIDENCES', 'BUILDING_OCCUPANCY_TYPE_CONFIDENCES', 'OCCUPANCY_TYPE_ATC_DESCRIPTION', 'OCCUPANCY_TYPE_SIC_DESCRIPTION', 'FACADE_MATERIAL_CONFIDENCES', 'IMAGERY_CAPTURE_DATE', 'REPLACEMENT_COST_CURRENCY', 'ADDRESS']
+
+# Columns to rename
+columns_dict = {}
+
+df_new = drop_and_rename_upper_to_lower_columns(df_new, columns_to_drop=columns_to_drop, columns_dict=columns_dict)
+
+# COMMAND ----------
+
+# Check missing values 
+df_missing = missing_values_table(df_new)
+
+# COMMAND ----------
+
+# Select only the top 20 columns with missing values
+top_missing = df_missing.head(20)
+# Create a barchart of the top 20
+plt.figure(figsize=(8, 4))
+plt.bar(top_missing['column_name'], top_missing['percent_missing'], color='blue')
+plt.xticks(rotation=90)
+plt.xlabel('Column names')
+plt.ylabel('% Missing Values')
+plt.title('Top 20 columns with missing values')
+plt.show()
+
+# COMMAND ----------
+
+# Dropped column with more than 60% missing values
+df_to_model = drop_missing_columns(df_new, threshold=0.6)
+
+# COMMAND ----------
+
+# Take a copy of dataframe for the purpose eda
+df_eda = df_to_model.copy()
+# Drop id and some features that might cause issue in building the visualisation from the df_eda
+df_eda = df_eda.drop(['location_id', 'latitude', 'longitude'], axis=1)
+# Split data into numerical and categorical features
+cat_cols, num_cols = split_categorical_numerical(df_eda)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Data Pre-processing functions
+
+# COMMAND ----------
+
+# Convert column values into a lowercase
+column_names = ['construction_type', 'roof_geometry', 'roof_pitch', 'building_occupancy_type', 'facade_material', 'roof_material_us', 'roof_condition', 'facade_condition', 'quality_of_finishes']
+
+df_to_model = convert_column_to_lowercase(df_to_model, column_names)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Exploratory Analysis (EDA)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Uni-variate Analysis
+
+# COMMAND ----------
+
+#  Target variable
+sns.countplot(data=df_to_model, x='target_variable');
+
+# COMMAND ----------
+
+# Drop id and some features that might cause issue in building the visualisation from the df_eda
+df_eda = df_to_model.drop(['location_id', 'latitude', 'longitude'], axis=1)
+fig = plt.figure(figsize=(30, 15))
+
+for i in range(len(cat_cols)):
+    column = cat_cols[i]
+    sub = fig.add_subplot(6, 4, i + 1)
+    chart = sns.countplot(data=df_eda, x=column);
+    plt.xticks(rotation=0)
+plt.tight_layout()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Bi-variate Analysis
+
+# COMMAND ----------
+
+# Extracting data to use in Bi-variate analysis
+df_bi_variate_data = df_to_model[cat_cols]
+df_bi_variate_data['target_variable'] = df_to_model['target_variable']
+
+fig = plt.figure(figsize=(30, 15))
+
+for i in range(len(cat_cols)):
+    column = cat_cols[i]
+    sub = fig.add_subplot(6, 4, i + 1)
+    chart = sns.countplot(data=df_bi_variate_data, x=column, hue='target_variable')
+plt.tight_layout()
+
+# COMMAND ----------
+
+# MAGIC %md 
+# MAGIC ##### Data Pre-processing Phase functions continuation
+
+# COMMAND ----------
+
+# Split data into training, testing sets
+X_train, y_train, X_test, y_test = split_data(df_to_model, test_size=0.2, random_state=42)
+# Print the shapes of the training, testing and validation data
+print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+print(f"X_test: {X_test.shape}, y_test: {y_test.shape}")
+
+# COMMAND ----------
+
+# Handling High Cardinality (Sparse) variables
+cols_thresh = [('construction_type',10000), ('construction_type_rms',10000), ('construction_type',10000), ('roof_geometry',10000), ('building_occupancy_type',9000), ('facade_material',10000), ('roof_material_us',10000), ('quality_of_finishes',10000), ('flood_zone',10000), ('nr_of_stories', 14000)]
+
+# Loop through the list of tuples and call handle_high_cardinality function for each column
+for col, thresh in cols_thresh:
+    X_train = handle_high_cardinality(X_train, col, thresh)
+    X_test = handle_high_cardinality(X_test, col, thresh)
+
+# COMMAND ----------
+
+# Split X_train into categorical and numerical features
+cat_features, num_features = split_categorical_numerical(X_train)
+# Pre-processing pipeline
+preprocessor = preprocess_data(num_features, cat_features)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Data to use in performing feature selection
+
+# COMMAND ----------
+
+# Fit X_train using the pre-processing pipeline
+transformer = preprocessor.fit(X_train)
+
+# COMMAND ----------
+
+# Get back all the column names
+cols = num_features + transformer.transformers_[1][1][1].get_feature_names().tolist()
+
+# COMMAND ----------
+
+# Transform X_train to a dataframe
+X_train_new = pd.DataFrame(preprocessor.fit_transform(X_train), columns=cols)
+X_train_new.head()
+
+# COMMAND ----------
+
+# Transform X_train to a dataframe
+X_test_new = pd.DataFrame(preprocessor.transform(X_test), columns=cols)
+X_test_new.head()
+
+# COMMAND ----------
+
+register_spark() # register spark backend
+# Define the model estimator
+estimator = RandomForestClassifier(random_state=42)
+with parallel_backend('spark', n_jobs=-1):
+# Feature Selection to find the optimal number of features
+  X_train_optimal, X_test_optimal = feature_selection(X_train_new, y_train, X_test_new, estimator, scoring='accuracy')
+
+# COMMAND ----------
+
+# Check the Optimal features
+X_train_optimal.head()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #####  Modelling Phase functions
+
+# COMMAND ----------
+
+register_spark() # register spark backend
+with parallel_backend('spark', n_jobs=-1):
+    best_clf = select_best_algorithm(X_train_optimal, y_train, cv=5)
+
+# COMMAND ----------
+
+register_spark() # register spark backend
+# Model Optimisation
+# Create an instance of the classifier
+estimator = CatBoostClassifier(verbose=False, random_state=42)
+with parallel_backend('spark', n_jobs=-1):
+    best_param = build_and_optimise_model(X_train_optimal, y_train, X_test_optimal, y_test, estimator)
+
+# COMMAND ----------
+
+register_spark() # register spark backend
+# Model training 
+# Create an instance of the classifier
+model = CatBoostClassifier(verbose=False, random_state=42, **best_param)
+with parallel_backend('spark', n_jobs=-1):
+    cargo_model_pipe = ml_pipeline(preprocessor, X_train, y_train, model)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Save Model with pickle
+
+# COMMAND ----------
+
+# Save model to into the FileStore of DataBricks account
+with open('/dbfs/FileStore/cargo_model_pipe.pkl', 'wb') as file:
+    pickle.dump(cargo_model_pipe, file)
+
+# COMMAND ----------
+
+# Load the saved model from file
+with open('/dbfs/FileStore/cargo_model_pipe.pkl', 'rb') as file:
+    cargo_model_pipe = pickle.load(file)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Evaluation Phase
+
+# COMMAND ----------
+
+evaluate_model(cargo_model_pipe, X_train, X_test, y_train, y_test)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Feature Importances
+
+# COMMAND ----------
+
+# Get back all the column names
+selected_features = cargo_model_pipe.named_steps['feature_selection'].get_support()
+# Causing some issues (Not necessary when we re-train the model)
+#new_select_features = np.delete(selected_features, 63) # drop index 63
+cols = X_train_new.columns[selected_features]
+# Extract feature importance from the model pipeline
+importance = cargo_model_pipe.steps[2][1].feature_importances_#coef_.ravel()
+# Causing some issue (Not necessary when re-train the model)
+#importance_new = np.delete(importance, 24)
+# Create a dataframe with the coefficients
+df_feature_p = pd.DataFrame({'feature':cols, 'importance':importance})
+# Sort the dataframe by importance
+df_feature_p = df_feature_p.sort_values('importance', ascending=False)
+# Plot the model coefficient
+plt.figure(figsize=(8, 7))
+plt.barh(df_feature_p['feature'], df_feature_p['importance'])
+plt.xlabel('Feature importance')
+plt.ylabel('Features')
+plt.title('Model feature importance')
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md 
+# MAGIC ### Create data for Risk Score and Probabilities
+
+# COMMAND ----------
+
+# Make a copy of df_to_shape
+X_test_risk_score = X_test.copy()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Calculate the best threshold for model
+
+# COMMAND ----------
+
+# Make predictions on the testing data
+y_pred_prob = cargo_model_pipe.predict_proba(X_test)[:, 1]
+
+# Generate a range of thresholds from 0 to 1 with step size 0.01
+thresholds = np.arange(0, 1, 0.01)
+
+precision_scores = []
+recall_scores = []
+f1_scores = []
+
+for threshold in thresholds:
+    # Convert predicted probabilities to binary predictions using the threshold
+    pred_class = (y_pred_prob >= threshold) * 1
+    
+    # Calculate precision, recall, and F1 scores for the binary predictions
+    precision = precision_score(y_test, pred_class, zero_division=0)
+    precision_scores.append(precision)
+    
+    recall = recall_score(y_test, pred_class)
+    recall_scores.append(recall)
+
+    f1 = f1_score(y_test, pred_class)
+    f1_scores.append(f1)
+
+# Find the maximum F1 score and its corresponding threshold
+max_f1_idx = np.argmax(f1_scores)
+best_threshold = thresholds[max_f1_idx]
+max_f1 = f1_scores[max_f1_idx]
+
+# Plot the precision, recall, and F1 scores against the threshold values
+#plt.style.use("seaborn-poster")
+plt.figure(figsize=(8, 6))
+plt.figure
+plt.plot(thresholds, precision_scores, label='Precision', linestyle='--')
+plt.plot(thresholds, recall_scores, label='Recall', linestyle='--')
+plt.plot(thresholds, f1_scores, label='F1', linewidth=5)
+plt.title(f"Finding the Optimal Threshold for Classification Model \n Max F1: {round(max_f1, 2)} (Threshold = {round(best_threshold, 2)})")
+plt.xlabel("Threshold")
+plt.ylabel("Assessment Score")
+plt.legend(loc="lower left")
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+best_threshold
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Plot Confusion Matrix for the best threshold
+
+# COMMAND ----------
+
+y_pred_best_thresh = (cargo_model_pipe.predict_proba(X_test)[:, 1] > best_threshold).astype('float')
+cm = confusion_matrix(y_test, y_pred_best_thresh) #normalize='all' Use for proportion
+cmd = ConfusionMatrixDisplay(cm, display_labels=['No Fire', 'Fire occure'])
+cmd.plot();
+plt.title('Confusion Matrix for the best threshold with proportion')
+cmd.ax_.set(xlabel='Predict', ylabel='Actual')
+plt.show()
+
+# COMMAND ----------
+
+precision = precision_score(y_test, y_pred_best_thresh)
+recall = recall_score(y_test, y_pred_best_thresh)
+accuracy = accuracy_score(y_test, y_pred_best_thresh)
+f1 = f1_score(y_test, y_pred_best_thresh)
+auc_roc = roc_auc_score(y_test, y_pred_best_thresh)
+print(f'Accuracy score on testing set: ', accuracy)
+print('---------------------------------------------------------------------')
+print(f'Precision :', precision)
+print('---------------------------------------------------------------------')
+print(f'Recall :', recall)
+print('---------------------------------------------------------------------')
+print(f'F1-score', f1)
+print('---------------------------------------------------------------------')
+print(f'roc auc', auc_roc)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Make Prediction and create a risk score out of it.
+
+# COMMAND ----------
+
+# Make predictions on the new data 
+proba_scores_new = cargo_model_pipe.predict_proba(X_test_risk_score)[:, 1] 
+
+# COMMAND ----------
+
+X_test_risk_score['probabilities'] = proba_scores_new
+
+# COMMAND ----------
+
+thresholds = []
+for n in range(1,11):
+    threshold = np.percentile(proba_scores_new,np.arange(0,100,10))[-n]
+    thresholds.append(threshold)
+
+# COMMAND ----------
+
+def probability_to_risk_score(probability, model_thresholds):
+    '''
+    Converts the probability of a model to risk scores by using the decile threshold of a sepcifc model
+
+    The function recieves 2 arguments, the first argument is the probability of the model and the second
+
+    argument is an ordered array (from larger to smallest)
+    '''
+
+    if probability>=model_thresholds[0]:
+        return 10
+    elif probability>=model_thresholds[1] and probability<model_thresholds[0]: 
+        return 9 
+    elif probability>=model_thresholds[2] and probability<model_thresholds[1]:
+        return 8
+
+    elif probability>=model_thresholds[3] and probability<model_thresholds[2]: 
+        return 7 
+    elif probability>=model_thresholds[4] and probability<model_thresholds[3]:
+        return 6
+
+    elif probability>=model_thresholds[5] and probability<model_thresholds[4]:
+        return 5 
+    elif probability>=model_thresholds[6] and probability<model_thresholds[5]:
+        return 4 
+    elif probability>=model_thresholds[7] and probability<model_thresholds[6]:
+        return 3
+    elif probability>=model_thresholds[8] and probability<model_thresholds[7]:
+        return 2
+    else:
+        return 1
+
+# COMMAND ----------
+
+X_test_risk_score["text"]=X_test_risk_score.apply(lambda x: probability_to_risk_score(x['probabilities'], thresholds), axis=1)
+
+# COMMAND ----------
+
+# Save threshold
+with open('/dbfs/FileStore/threshold.pkl', 'wb') as file:
+    pickle.dump(threshold, file)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Create data for SHAP Explainer
+
+# COMMAND ----------
+
+# Take a copy of data
+x_train = X_train_new.copy()
+x_test = X_test_new.copy()
+# Concatenate X_train_new and X_test_new 
+df_before_shap = pd.concat([x_train, x_test], ignore_index=True)
+
+# COMMAND ----------
+
+def generate_shap_values(model, X_test, df):
+    """
+    Function to generate shap values.
+    : Param model: The classifier to explain.
+    : Param X_train: The training features.
+    : Param df: The dataframe to explain.
+    """
+    # Explain model predictions using SHAP values
+    explainer = shap.TreeExplainer(model.named_steps['classifier'], data=model.named_steps['preprocessing_pipeline'].transform(X_test))
+    #shap_values = explainer(model.named_steps['preprocessing_pipeline'].transform(df))
+    shap_values = explainer(df)
+    return explainer, shap_values
+
+# COMMAND ----------
+
+register_spark() # register spark backend
+with parallel_backend('spark', n_jobs=-1):
+    explainer, shap_values = generate_shap_values(cargo_model_pipe, X_test, df_before_shap)
+
+# COMMAND ----------
+
+with open('/dbfs/FileStore/explainer.pkl', 'wb') as file:
+    pickle.dump(explainer, file)
+
+# COMMAND ----------
+
+with open('/dbfs/FileStore/explainer.pkl', 'rb') as file:
+    explainer_loaded = pickle.load(file)
+
+# COMMAND ----------
+
+X_test_10 = X_test.head(10)
+
+# COMMAND ----------
+
+df_shap_tester = X_test.head(500)
+
+# COMMAND ----------
+
+#shap_values_model_prob = explainer_loaded.shap_values(X_train_shap_10)
+shap_values_model_prob = explainer_loaded.shap_values(cargo_model_pipe.named_steps['preprocessing_pipeline'].transform(df_shap_tester))
+
+# COMMAND ----------
+
+final_predictions = cargo_model_pipe.predict_proba(df_shap_tester)[:, 1]
+
+# COMMAND ----------
+
+Production_dataframe = pd.DataFrame(columns=['PROBABILITY', 'explanations'])
+
+# COMMAND ----------
+
+number_of_explanations=10
+
+# COMMAND ----------
+
+def xgb_shap_transform_scale(shap_values, model_prediction):
+    """
+    Function that transformed log odds to probabilities.
+    """
+    #Compute the transformed base value, which consists in applying the logit function to the base value
+    untransformed_base_value = shap_values[-1]
+    base_value = expit(untransformed_base_value )
+    #Computing the original_explanation_distance to construct the distance_coefficient later on
+    original_explanation_distance = sum(shap_values)
+    #Computing the distance between the model_prediction and the transformed base_value
+    distance_to_explain = (model_prediction - base_value)
+    #The distance_coefficient is the ratio between both distances which will be used later on
+    distance_coefficient = original_explanation_distance / distance_to_explain
+    #Transforming the original shapley values to the new scale
+    shap_values_transformed = shap_values / distance_coefficient
+    #Finally resetting the base_value as it does not need to be transformed
+    shap_values_transformed [-1] = base_value
+    #Now returning the transformed array
+    return shap_values_transformed
+
+# COMMAND ----------
+
+final_list_of_dictionaries = []
+
+for j in range(df_shap_tester.shape[0]):
+    shap_values=shap_values_model_prob[j]
+    #instead of scorring the model all the time i should save the preidcitons
+    model_prediction=final_predictions[j]
+    shap_proba=xgb_shap_transform_scale(shap_values, model_prediction)
+    #Get the position in array of the 10 larger values
+    arr =shap_values
+    large_indexes=arr.argsort()[-number_of_explanations:][::-1] #get the position of the 10 largest values
+    largest_values=np.sort(arr)[-number_of_explanations:][::-1]# 10 largest values
+    smallest_values=np.sort(arr)[:number_of_explanations] # 10 lowest values
+    smallest_indexes=arr.argsort()[:number_of_explanations] #indexes of the 10 lowest vlues
+    large_values= {}
+    for A, B in zip(large_indexes, largest_values):
+        large_values[A] = B
+    small_values= {}
+    for A, B in zip(smallest_indexes, smallest_values):
+        small_values[A] = B
+    #merge the 2 dictionaries
+    combined_dictionary = {**large_values, **small_values}
+    main_keys = sorted(combined_dictionary, key=lambda dict_key: abs(combined_dictionary[dict_key]))[-10:]
+    #the 10 keys with the largest absolute values
+    final_dictioanry = dict((k, combined_dictionary[k]) for k in main_keys if k in combined_dictionary)
+    DSS_dictionary_output= {}
+    for key, value in final_dictioanry.items():
+        colname = X_test.columns[key]
+        DSS_dictionary_output[colname] = value
+    DSS_dataframe = pd.DataFrame([DSS_dictionary_output])
+    #Try to convert the row to json instead of creating new columns
+    DSS_dataframe.astype(str)
+    row_json_similar_to_JSON_FOR_JAVACRIPT = DSS_dataframe.to_json(orient='records')[1:-1].replace('},{', '} {')
+    row_json_similar_to_JSON_FOR_JAVACRIPT_clean = row_json_similar_to_JSON_FOR_JAVACRIPT.replace("/", "_")
+    row_json_similar_to_JSON_FOR_JAVACRIPT_clean = row_json_similar_to_JSON_FOR_JAVACRIPT_clean.replace("\\", "")
+    #Need to convert the predcition to score by using the deciles
+    row_list=[model_prediction,row_json_similar_to_JSON_FOR_JAVACRIPT_clean]
+    row_df = pd.DataFrame([row_list],columns=['PROBABILITY', 'explanations'],dtype=str) # i foce all columns to be strings helps with the json
+    Production_dataframe = Production_dataframe.append(row_df, ignore_index=True)
+    #to mono pou alaka einai to eplaantions edo kai pano pou ftiaxno proti fora to dataframe apo kefalea se mikra
+    ## Extra append the dictioanry to my list 
+    final_list_of_dictionaries.append(DSS_dictionary_output)
+
+# COMMAND ----------
+
+Production_dataframe
+
+# COMMAND ----------
+
+dict1 = {}
+for dict2 in final_list_of_dictionaries:
+    for key in dict2:
+        if key in dict1:
+            dict1[key] = dict2[key] + dict1[key]
+        else:
+            dict1[key] = dict2[key]
+
+# COMMAND ----------
+
+for i in dict1:
+    dict1[i] = float(dict1[i]/df_shap_tester.shape[0])
+
+# COMMAND ----------
+
+highest_5 = dict(sorted(dict1.items(), key=lambda x: x[1], reverse=True)[:number_of_explanations])
+lowest_5 = dict(sorted(dict1.items(), key=lambda x: x[1], reverse=True)[number_of_explanations:])
+
+# COMMAND ----------
+
+combined_dictionary = {**highest_5, **lowest_5}
+main_keys = sorted(combined_dictionary, key=lambda dict_key: abs(combined_dictionary[dict_key]))[-10:]
+#the 10 keys with the largest absolute values
+DSS_dictionary_output = dict((k, combined_dictionary[k]) for k in main_keys if k in combined_dictionary)
+DSS_dataframe = pd.DataFrame([DSS_dictionary_output])
+#Try to convert the row to json instead of creating new columns
+DSS_dataframe.astype(str)
+row_json_similar_to_JSON_FOR_JAVACRIPT = DSS_dataframe.to_json(orient='records')[1:-1].replace('},{', '} {')
+row_json_similar_to_JSON_FOR_JAVACRIPT_clean = row_json_similar_to_JSON_FOR_JAVACRIPT.replace("/", "_")
+row_json_similar_to_JSON_FOR_JAVACRIPT_clean = row_json_similar_to_JSON_FOR_JAVACRIPT_clean.replace("\\", "")
+
+# COMMAND ----------
+
+############## Combine the dataset final to pandas
+Production_dataframe["final_shap"]=row_json_similar_to_JSON_FOR_JAVACRIPT_clean
+
+# COMMAND ----------
+
+Production_dataframe.head()
+
